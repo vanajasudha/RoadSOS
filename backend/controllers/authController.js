@@ -1,6 +1,82 @@
 const jwt  = require('jsonwebtoken');
 const User = require('../models/User');
 
+// ── Firebase Admin (lazy init) ────────────────────────────────────────────────
+let _admin = null;
+function getAdmin() {
+  if (_admin) return _admin;
+  const admin = require('firebase-admin');
+  if (!admin.apps.length) {
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        projectId:   process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        privateKey:  process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+      }),
+    });
+  }
+  _admin = admin;
+  return admin;
+}
+
+function issueJwt(userId) {
+  return jwt.sign({userId}, process.env.JWT_SECRET, {expiresIn: '30d'});
+}
+
+// ── POST /api/auth/firebase-login ─────────────────────────────────────────────
+const firebaseLogin = async (req, res) => {
+  try {
+    const {idToken, name} = req.body;
+    if (!idToken) {
+      return res.status(400).json({success: false, message: 'Firebase ID token is required'});
+    }
+
+    const admin    = getAdmin();
+    const decoded  = await admin.auth().verifyIdToken(idToken);
+    const rawPhone = decoded.phone_number;
+
+    if (!rawPhone) {
+      return res.status(400).json({success: false, message: 'Token does not contain a phone number'});
+    }
+
+    // Firebase gives +91XXXXXXXXXX — store as 10-digit local number
+    const phone = rawPhone.replace(/^\+91/, '');
+
+    let user = await User.findOne({phone});
+
+    if (!user) {
+      if (!name || !name.trim()) {
+        return res.status(400).json({
+          success:      false,
+          message:      'Please enter your name to complete signup',
+          requiresName: true,
+        });
+      }
+      user = await User.create({phone, name: name.trim()});
+    } else if (name && name.trim() && !user.name) {
+      user.name = name.trim();
+      await user.save();
+    }
+
+    const token = issueJwt(user._id);
+    return res.json({
+      success: true,
+      token,
+      user: {_id: user._id, name: user.name, phone: user.phone},
+    });
+  } catch (err) {
+    console.error('[firebaseLogin]', err.message);
+    if (err.code === 'auth/id-token-expired') {
+      return res.status(401).json({success: false, message: 'Session expired. Please login again.'});
+    }
+    if (err.code?.startsWith('auth/')) {
+      return res.status(401).json({success: false, message: 'Invalid authentication token'});
+    }
+    return res.status(500).json({success: false, message: 'Server error'});
+  }
+};
+
+// ── POST /api/auth/send-otp (legacy) ─────────────────────────────────────────
 const sendOtp = async (req, res) => {
   try {
     const {phone} = req.body;
@@ -9,7 +85,7 @@ const sendOtp = async (req, res) => {
     }
 
     const otp       = Math.floor(100000 + Math.random() * 900000).toString();
-    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 min
+    const otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
 
     await User.findOneAndUpdate(
       {phone},
@@ -21,7 +97,7 @@ const sendOtp = async (req, res) => {
     return res.json({
       success: true,
       message: 'OTP sent successfully',
-      ...(isDev && {otp}),   // only exposed in dev — never in production
+      ...(isDev && {otp}),
     });
   } catch (err) {
     console.error('[sendOtp]', err.message);
@@ -29,6 +105,7 @@ const sendOtp = async (req, res) => {
   }
 };
 
+// ── POST /api/auth/verify-otp (legacy) ───────────────────────────────────────
 const verifyOtp = async (req, res) => {
   try {
     const {phone, otp, name} = req.body;
@@ -64,20 +141,11 @@ const verifyOtp = async (req, res) => {
     if (name) {user.name = name;}
     await user.save();
 
-    const token = jwt.sign(
-      {userId: user._id},
-      process.env.JWT_SECRET,
-      {expiresIn: '30d'},
-    );
-
+    const token = issueJwt(user._id);
     return res.json({
       success: true,
       token,
-      user: {
-        _id:   user._id,
-        name:  user.name,
-        phone: user.phone,
-      },
+      user: {_id: user._id, name: user.name, phone: user.phone},
     });
   } catch (err) {
     console.error('[verifyOtp]', err.message);
@@ -85,6 +153,7 @@ const verifyOtp = async (req, res) => {
   }
 };
 
+// ── GET /api/auth/me ──────────────────────────────────────────────────────────
 const getMe = async (req, res) => {
   try {
     const user = await User.findById(req.userId).select('-otp -otpExpiry');
@@ -98,6 +167,7 @@ const getMe = async (req, res) => {
   }
 };
 
+// ── PATCH /api/auth/profile ───────────────────────────────────────────────────
 const updateProfile = async (req, res) => {
   try {
     const {name} = req.body;
@@ -122,4 +192,4 @@ const updateProfile = async (req, res) => {
   }
 };
 
-module.exports = {sendOtp, verifyOtp, getMe, updateProfile};
+module.exports = {firebaseLogin, sendOtp, verifyOtp, getMe, updateProfile};

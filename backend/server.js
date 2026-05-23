@@ -82,6 +82,7 @@ mongoose
       console.log(`ROADSoS server running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);
       if (!isProd) {
         console.log('Routes:');
+        console.log('  POST   /api/auth/firebase-login');
         console.log('  POST   /api/auth/send-otp');
         console.log('  POST   /api/auth/verify-otp');
         console.log('  GET    /api/auth/me');
